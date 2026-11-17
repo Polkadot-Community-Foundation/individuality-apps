@@ -1,0 +1,192 @@
+# Copyright 2026 Polkadot Community Foundation
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: Deploy (devnet)
+
+# PCF devnet lane. A dispatch on `devnet` checks and builds one product, publishes it to its
+# DotNS name on the pcf-devnet stack, then tags the deployed commit `devnet/<YYYY-MM-DD>.<n>`.
+# A dispatch on a `devnet/*` tag redeploys that tag (rollback). A dispatch on any other ref
+# runs the checks and the build only and uploads the bundles.
+#
+# The names are the products' protocol ids (docs/deploying.md): Jollity is `dim2.dot`,
+# Humanity is `peopl.dot`. The deploy phrase is only in the publish step's environment.
+
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: Product to deploy
+        type: choice
+        options: [jollity, humanity]
+
+permissions:
+  contents: read
+
+# Deploys write on-chain records. They queue and are never cancelled mid-flight.
+concurrency:
+  group: deploy-devnet
+  cancel-in-progress: false
+
+env:
+  BULLETIN_DEPLOY_SPEC: bulletin-deploy@0.25.0
+  BULLETIN_DEPLOY_TELEMETRY: "off"
+  DEPLOY_ENV: pcf-devnet
+
+jobs:
+  deploy:
+    name: ${{ inputs.product }} (devnet)
+    runs-on: ubuntu-latest
+    environment: devnet
+    timeout-minutes: 60
+    outputs:
+      domain: ${{ steps.product.outputs.domain }}
+      app: ${{ steps.cids.outputs.app }}
+      worker: ${{ steps.cids.outputs.worker }}
+    env:
+      PUBLISH: ${{ github.ref == 'refs/heads/devnet' || startsWith(github.ref, 'refs/tags/devnet/') }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Select the product
+        id: product
+        env:
+          PRODUCT: ${{ inputs.product }}
+        run: |
+          case "$PRODUCT" in
+            jollity) echo "domain=dim2.dot" >> "$GITHUB_OUTPUT" ;;
+            humanity) echo "domain=peopl.dot" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::unknown product: $PRODUCT"; exit 1 ;;
+          esac
+
+      - run: npm ci
+
+      - name: Check Jollity
+        if: inputs.product == 'jollity'
+        run: |
+          npm run lint
+          npm run typecheck
+          npm run typecheck:engines
+          npm test
+
+      - name: Build Jollity
+        if: inputs.product == 'jollity'
+        env:
+          NEXT_PUBLIC_NETWORK_NAME: ${{ env.DEPLOY_ENV }}
+          NEXT_PUBLIC_PRODUCT_DOTNS: ${{ steps.product.outputs.domain }}
+          PRODUCT_DOTNS: ${{ steps.product.outputs.domain }}
+        run: |
+          npm run build
+          npm run build:chat
+          test -s apps/jollity-app/out/index.html
+          test -s apps/jollity-worker/dist/index.js
+
+      - name: Check Humanity
+        if: inputs.product == 'humanity'
+        run: |
+          npm run humanity:lint
+          npm run humanity:typecheck
+          npm run humanity:test
+
+      - name: Build Humanity
+        if: inputs.product == 'humanity'
+        env:
+          VITE_NETWORK: ${{ env.DEPLOY_ENV }}
+          VITE_DOTNS_PRODUCT_LABEL: peopl
+        run: |
+          npm run humanity:build
+          test -s apps/humanity-app/dist/index.html
+          test -s apps/humanity-worker/dist/index.js
+
+      - name: Upload the bundles
+        if: env.PUBLISH != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.product }}-devnet
+          path: |
+            apps/jollity-app/out
+            apps/jollity-worker/dist
+            apps/humanity-app/dist
+            apps/humanity-worker/dist
+          if-no-files-found: error
+
+      - name: Publish Jollity
+        if: env.PUBLISH == 'true' && inputs.product == 'jollity'
+        uses: nick-fields/retry@v3
+        env:
+          MNEMONIC: ${{ secrets.DOTNS_MNEMONIC }}
+          DEPLOY_DOMAIN: ${{ steps.product.outputs.domain }}
+          DEPLOY_TRUSTED_PRODUCTS: '{"peopl":["storage"]}'
+          NODE_OPTIONS: --max-old-space-size=8192
+        with:
+          timeout_minutes: 20
+          max_attempts: 3
+          retry_wait_seconds: 30
+          shell: bash
+          command: |
+            set -o pipefail
+            test -n "$MNEMONIC" || { echo "::error::DOTNS_MNEMONIC is not set in the devnet environment"; exit 1; }
+            npx -y "$BULLETIN_DEPLOY_SPEC" --env "$DEPLOY_ENV" --js-merkle \
+              --config deploy/bulletin-deploy.config.ts --no-transfer-to-signedin-user \
+              ./apps/jollity-app/out "$DEPLOY_DOMAIN" 2>&1 | tee deploy.log
+
+      - name: Publish Humanity
+        if: env.PUBLISH == 'true' && inputs.product == 'humanity'
+        env:
+          DOTNS_MNEMONIC: ${{ secrets.DOTNS_MNEMONIC }}
+          DOTNS_LABEL: peopl
+          VITE_NETWORK: ${{ env.DEPLOY_ENV }}
+          HUMANITY_TRUSTED_PRODUCTS: '{"faucet":["context"],"aliasprobe":["context"],"dim2":["context","storage"]}'
+        run: |
+          set -o pipefail
+          test -n "$DOTNS_MNEMONIC" || { echo "::error::DOTNS_MNEMONIC is not set in the devnet environment"; exit 1; }
+          npx -y -p "$BULLETIN_DEPLOY_SPEC" -- npm run humanity:setup -- --env "$DEPLOY_ENV" --skip-build 2>&1 | tee deploy.log
+
+      - name: Read the published CIDs
+        id: cids
+        if: env.PUBLISH == 'true'
+        env:
+          DOMAIN: ${{ steps.product.outputs.domain }}
+        run: |
+          cid_for() { grep -iE "executable \[$1\] cid" deploy.log | tail -1 | grep -oE '(bafy|Qm)[A-Za-z0-9]+' | tail -1; }
+          APP=$(cid_for app)
+          WORKER=$(cid_for worker)
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "worker=$WORKER" >> "$GITHUB_OUTPUT"
+          {
+            echo "### $DOMAIN on devnet"
+            echo "- app: \`${APP:-not found in the log}\`"
+            echo "- worker: \`${WORKER:-not found in the log}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tag:
+    needs: deploy
+    if: github.ref == 'refs/heads/devnet'
+    name: Tag the deployed commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tag the deployed commit
+        env:
+          DOMAIN: ${{ needs.deploy.outputs.domain }}
+          APP: ${{ needs.deploy.outputs.app }}
+          WORKER: ${{ needs.deploy.outputs.worker }}
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y-%m-%d)
+          LAST=$(git ls-remote --tags origin "refs/tags/devnet/${DATE}.*" \
+            | sed -n "s#.*refs/tags/devnet/${DATE}\.\([0-9]*\)\$#\1#p" | sort -n | tail -1)
+          TAG="devnet/${DATE}.$(( ${LAST:-0} + 1 ))"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" "$GITHUB_SHA" \
+            -m "${DOMAIN} devnet deploy, run ${GITHUB_RUN_ID}" -m "app ${APP}" -m "worker ${WORKER}"
+          git push origin "refs/tags/$TAG"
+          echo "### Tagged \`$TAG\` at ${GITHUB_SHA:0:8}" >> "$GITHUB_STEP_SUMMARY"
